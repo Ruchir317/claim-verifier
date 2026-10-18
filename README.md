@@ -1,8 +1,10 @@
-# SearchAPI
+# Claim Verifier
+
+*Formerly SearchAPI.*
 
 Give it a claim; it searches the web, reads the evidence and returns a **True / False verdict with its reasoning**.
 
-SearchAPI is the retrieval-and-verdict prototype behind [FACTUAL](https://ruchirjadhav.dev/projects/factual), a real-time speech fact-checking project. It runs on its own as a batch tool: point it at a file of claims and it produces structured JSON you can inspect and score.
+Claim Verifier is the retrieval-and-verdict prototype behind [FACTUAL](https://ruchirjadhav.dev/projects/factual), a real-time speech fact-checking project. It runs on its own as a batch tool: point it at a file of claims and it produces structured JSON you can inspect and score.
 
 ## How it works
 
@@ -112,3 +114,7 @@ The tests replace Google, Gemini and the web with fakes, so they run offline and
 ## Data
 
 `data/politifact_factcheck_data.json` is a public dump of PolitiFact fact-checks (JSON lines), included so the project runs out of the box. The ratings belong to PolitiFact; check their terms before reusing the data elsewhere.
+
+## License
+
+MIT, see [LICENSE](LICENSE). It covers the code only, not the PolitiFact data.
