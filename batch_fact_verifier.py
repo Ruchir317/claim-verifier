@@ -1,294 +1,328 @@
-import os
-import json
-import re
-import time
-import requests
+"""Batch fact verification.
+
+For every claim: Google Custom Search -> download and summarise the top articles -> ask Gemini for a
+True/False verdict grounded only in those summaries. Progress is checkpointed, so an interrupted run
+resumes where it stopped.
+
+    python batch_fact_verifier.py --start 0 --end 50
+"""
 import argparse
-import multiprocessing
-from newspaper import Article
-from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from google import genai
-from google.genai import types
-from tqdm import tqdm
+import json
+import os
+import re
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import nltk
+
+from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
 
-# ENVIRONMENT VARIABLES
-API_KEY = os.getenv("GEMINI_API_KEY")
-CSE_ID = os.getenv("GOOGLE_CSE_ID")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DEFAULT_INPUT = "data/politifact_factcheck_data.json"
+DEFAULT_OUTPUT_DIR = "output"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+MIN_SUMMARY_CHARS = 200
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
-# CONFIGURATION
-INPUT_FILE = "data/politifact_factcheck_data.json"
-OUTPUT_DIR = "output"
-CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "checkpoint.json")
-ERROR_LOG_FILE = os.path.join(OUTPUT_DIR, "error_log.txt")
-
-# Ensure output folder exists
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# OUTPUT CONTAINERS
-all_fact_results = []
-all_full_outputs = []
-all_parsed_outputs = []
-
-# RESUME CHECKPOINT
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
-
-def save_checkpoint(done_ids):
-    existing = set()
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            existing = set(json.load(f))
-    merged = sorted(existing.union(done_ids))
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(merged, f, indent=2)
-
-# INPUT DATA
-def load_statements(file_path, limit):
-    with open(file_path, "r", encoding="utf-8") as f:
-        return [(i, json.loads(line)["statement"]) for i, line in enumerate(f) if i < limit]
-
-# GOOGLE SEARCH
-def google_search(query, api_key, cse_id, num=10):
-    service = build("customsearch", "v1", developerKey=api_key)
-    res = service.cse().list(q=query, cx=cse_id, num=num).execute()
-    return res.get("items", [])
-
-# ARTICLE SUMMARIZATION
-def _extract_summary(url, return_dict):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-
-        article = Article(url)
-        article.set_html(response.text)
-        article.parse()
-        article.nlp()
-
-        return_dict["summary"] = article.summary
-    except Exception as e:
-        return_dict["summary"] = None
-
-def summarize_article(url, timeout=10):
-    manager = multiprocessing.Manager()
-    return_dict = manager.dict()
-
-    proc = multiprocessing.Process(target=_extract_summary, args=(url, return_dict))
-    proc.start()
-    proc.join(timeout)
-
-    if proc.is_alive():
-        print(f"⛔ Timeout exceeded for: {url}")
-        proc.terminate()
-        proc.join()
-        return None
-
-    return return_dict.get("summary", None)
-
-def filter_top_articles(articles, top_k=10):
-    scored = []
-    for a in articles:
-        summary = a.get("summary", "")
-        if summary and len(summary.strip()) >= 200:
-            scored.append((len(summary.strip()), a))
-    return [a for _, a in scored[:top_k]]
-
-# PROMPT BUILDING
-def build_input_from_fact(fact, articles):
-    input_str = f"**Factual Claim:**\n{fact}\n\n**Relevant Articles:**\n"
-    for i, article in enumerate(articles, 1):
-        input_str += f"\nArticle {i}:\n"
-        input_str += f"- **Title:** {article['title']}\n"
-        input_str += f"- **URL:** {article['url']}\n"
-        input_str += f"- **Snippet:** {article['snippet']}\n"
-        input_str += f"- **Summary:** {article['summary']}\n"
-    return input_str
-
-# PARSING
-def extract_section(header, text):
-    pattern = rf"\*\*{header}:\*\*\s*(.*?)(?=\n\*\*|$)"
-    match = re.search(pattern, text, re.DOTALL)
-    return match.group(1).strip() if match else None
-
-def extract_bullet_list(header, text):
-    section = extract_section(header, text)
-    return re.findall(r"[*\-]\s+(.*)", section) if section else []
-
-# GEMINI
-def run_gemini_verification(prompt_text, fact):
-    client = genai.Client(api_key=API_KEY)
-    model = "gemini-2.0-flash"
-    contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt_text)])]
-
-    config = types.GenerateContentConfig(
-        temperature=0,
-        response_mime_type="text/plain",
-        system_instruction=[
-            types.Part.from_text(text="""You are an automated fact-verification assistant. You will be given a structured input that contains:
+SYSTEM_PROMPT = """You are an automated fact-verification assistant. You will be given a structured input that contains:
 
 - A factual claim at the top
 - A list of summarized news articles that are relevant to that claim.
 
 You must return:
 
-**Verdict:** True or False  
-**Collective Summary:** Overall what the sources say  
-**Reasoning:** 2–4 sentence justification  
+**Verdict:** True or False
+**Collective Summary:** Overall what the sources say
+**Reasoning:** 2-4 sentence justification
 **Sources Summary:** Bullet list of titles with one-line context
 
-Only use the provided summaries. Be objective. Format your output in Markdown.""")
-        ]
-    )
+Only use the provided summaries. Be objective. Format your output in Markdown."""
 
-    full_response = ""
-    for chunk in client.models.generate_content_stream(
-        model=model, contents=contents, config=config
-    ):
-        full_response += chunk.text
 
-    return full_response.strip()
+# ---------------------------------------------------------------- input / output files
 
-# PROCESS EACH FACT
-def process_fact(index, fact, done_ids):
-    if index in done_ids:
-        return  # skip processed
+def load_statements(path, start, end):
+    """Claims from a JSON-lines file, as (line_index, statement) for start <= index < end."""
+    statements = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= end:
+                break
+            if i >= start and line.strip():
+                statements.append((i, json.loads(line)["statement"]))
+    return statements
 
-    articles_raw = google_search(fact, GOOGLE_API_KEY, CSE_ID, num=10)
-    enriched = []
 
-    for result in articles_raw:
-        url = result.get("link")
-        summary = summarize_article(url)
-        if summary:
-            enriched.append({
-                "title": result.get("title"),
-                "url": url,
-                "snippet": result.get("snippet"),
-                "summary": summary
-            })
-        time.sleep(1)
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
 
-    top_articles = filter_top_articles(enriched, top_k=6)
-    if not top_articles:
-        raise ValueError("No valid articles found.")
 
-    all_fact_results.append({
+def write_json(path, data):
+    """Write atomically so an interrupted run never leaves a half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def merge_unique(existing, new, key="fact"):
+    seen, merged = set(), []
+    for item in list(existing) + list(new):
+        k = item.get(key)
+        if k and k not in seen:
+            merged.append(item)
+            seen.add(k)
+    return merged
+
+
+# ---------------------------------------------------------------- retrieval
+
+def ensure_nltk_data():
+    """newspaper3k's summariser needs NLTK's punkt tokenizer; without it every summary fails."""
+    import nltk
+
+    nltk.download("punkt_tab", quiet=True)
+
+
+def google_search(query, api_key, cse_id, num=10):
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+
+    service = build("customsearch", "v1", developerKey=api_key, cache_discovery=False)
+
+    def run(q):
+        return service.cse().list(q=q, cx=cse_id, num=min(num, 10)).execute().get("items", [])
+
+    try:
+        return run(query)
+    except HttpError as e:
+        # The API rejects some long or quote-heavy claims with HTTP 400: retry once with a plain query.
+        if getattr(e.resp, "status", None) == 400:
+            plain = re.sub(r"[\"“”‘’]", "", query)[:200].strip()
+            if plain and plain != query:
+                return run(plain)
+        raise
+
+
+def summarize_article(url, timeout=10):
+    """Download a page and return a short extractive summary, or None if it cannot be summarised."""
+    import requests
+    from newspaper import Article
+
+    try:
+        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        response.raise_for_status()
+        article = Article(url)
+        article.set_html(response.text)
+        article.parse()
+        article.nlp()
+        return article.summary or None
+    except Exception:
+        return None
+
+
+def filter_top_articles(articles, top_k=6, min_chars=MIN_SUMMARY_CHARS):
+    """Keep articles with a substantial summary, longest first."""
+    kept = [a for a in articles if len((a.get("summary") or "").strip()) >= min_chars]
+    kept.sort(key=lambda a: len(a["summary"].strip()), reverse=True)
+    return kept[:top_k]
+
+
+# ---------------------------------------------------------------- verification
+
+def build_prompt(fact, articles):
+    lines = [f"**Factual Claim:**\n{fact}\n\n**Relevant Articles:**\n"]
+    for i, article in enumerate(articles, 1):
+        lines.append(
+            f"\nArticle {i}:\n"
+            f"- **Title:** {article['title']}\n"
+            f"- **URL:** {article['url']}\n"
+            f"- **Snippet:** {article['snippet']}\n"
+            f"- **Summary:** {article['summary']}\n"
+        )
+    return "".join(lines)
+
+
+def extract_section(header, text):
+    match = re.search(rf"\*\*{re.escape(header)}:\*\*\s*(.*?)(?=\n\*\*|$)", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
+def extract_bullet_list(header, text):
+    section = extract_section(header, text)
+    return re.findall(r"[*\-]\s+(.*)", section) if section else []
+
+
+def parse_verification(fact, text):
+    return {
         "fact": fact,
-        "articles": top_articles
-    })
-
-    prompt = build_input_from_fact(fact, top_articles)
-    gemini_output = run_gemini_verification(prompt, fact)
-
-    all_full_outputs.append({
-        "fact": fact,
-        "gemini_output": gemini_output
-    })
-
-    parsed = {
-        "fact": fact,
-        "verdict": extract_section("Verdict", gemini_output),
-        "collective_summary": extract_section("Collective Summary", gemini_output),
-        "reasoning": extract_section("Reasoning", gemini_output),
-        "sources_summary": extract_bullet_list("Sources Summary", gemini_output)
+        "verdict": extract_section("Verdict", text),
+        "collective_summary": extract_section("Collective Summary", text),
+        "reasoning": extract_section("Reasoning", text),
+        "sources_summary": extract_bullet_list("Sources Summary", text),
     }
 
-    all_parsed_outputs.append(parsed)
-    done_ids.add(index)
 
-# FINAL SAVE
-def save_all_outputs():
-    def load_existing(path):
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
+def run_gemini_verification(prompt_text, api_key, model=DEFAULT_MODEL, retries=3):
+    from google import genai
+    from google.genai import types
 
-    def merge_unique(existing, new, key="fact"):
-        seen = set()
-        merged = []
-
-        for item in existing + new:
-            k = item.get(key)
-            if k and k not in seen:
-                merged.append(item)
-                seen.add(k)
-        return merged
-
-    fact_path = os.path.join(OUTPUT_DIR, "fact_results.json")
-    full_path = os.path.join(OUTPUT_DIR, "full_output.json")
-    parsed_path = os.path.join(OUTPUT_DIR, "parsed_output.json")
-
-    merged_facts = merge_unique(load_existing(fact_path), all_fact_results)
-    merged_full = merge_unique(load_existing(full_path), all_full_outputs)
-    merged_parsed = merge_unique(load_existing(parsed_path), all_parsed_outputs)
-
-    with open(fact_path, "w", encoding="utf-8") as f:
-        json.dump(merged_facts, f, ensure_ascii=False, indent=2)
-
-    with open(full_path, "w", encoding="utf-8") as f:
-        json.dump(merged_full, f, ensure_ascii=False, indent=2)
-
-    with open(parsed_path, "w", encoding="utf-8") as f:
-        json.dump(merged_parsed, f, ensure_ascii=False, indent=2)
-
-# ERROR LOGGING
-def log_error(index, fact, error):
-    new_line = f"[{index}] {fact[:100]}... → {str(error)}\n"
-
-    # Avoid duplicates
-    existing_lines = set()
-    if os.path.exists(ERROR_LOG_FILE):
-        with open(ERROR_LOG_FILE, "r", encoding="utf-8") as f:
-            existing_lines = set(f.readlines())
-
-    if new_line not in existing_lines:
-        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(new_line)
-
-# MAIN
-def run_verification_batch(start_idx=0, end_idx=10, max_workers=4):
-    initial_done = load_checkpoint()
-    all_statements = load_statements(INPUT_FILE, end_idx)
-    statements = [(i, fact) for i, fact in all_statements if start_idx <= i < end_idx]
-    done_ids = load_checkpoint()
-
-    print(f"🧵 Running with {max_workers} threads...")
-
-    def safe_process(index_fact):
-        index, fact = index_fact
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(temperature=0, system_instruction=SYSTEM_PROMPT)
+    for attempt in range(retries):
         try:
-            process_fact(index, fact, done_ids)
-            save_checkpoint(done_ids)
-            save_all_outputs()
-        except Exception as e:
-            log_error(index, fact, e)
+            response = client.models.generate_content(model=model, contents=prompt_text, config=config)
+            if not response.text:
+                raise ValueError("Gemini returned an empty response.")
+            return response.text.strip()
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** (attempt + 1))  # back off on rate limits and transient errors
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(tqdm(executor.map(safe_process, statements), total=len(statements)))
 
-    print(f"\n✅ Done! Processed range {start_idx}–{end_idx}")
-    print(f"🧠 Previously done: {len(initial_done)} | Newly saved: {len(done_ids) - len(initial_done)}")
+def process_fact(fact, keys, model=DEFAULT_MODEL, delay=0.5, top_k=6):
+    """Verify one claim. Returns (fact_result, full_output, parsed). Raises if no usable evidence."""
+    results = google_search(fact, keys["google_api_key"], keys["cse_id"], num=10)
+    enriched = []
+    for result in results:
+        url = result.get("link")
+        summary = summarize_article(url) if url else None
+        if summary:
+            enriched.append(
+                {"title": result.get("title"), "url": url, "snippet": result.get("snippet"), "summary": summary}
+            )
+        time.sleep(delay)
 
-# CLI entry point
-if __name__ == "__main__":
-    import argparse
-    from multiprocessing import freeze_support
+    top = filter_top_articles(enriched, top_k=top_k)
+    if not top:
+        raise ValueError("No valid articles found.")
 
-    freeze_support()  # Optional, but good to include on Windows
+    output = run_gemini_verification(build_prompt(fact, top), keys["gemini_api_key"], model=model)
+    return (
+        {"fact": fact, "articles": top},
+        {"fact": fact, "gemini_output": output},
+        parse_verification(fact, output),
+    )
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=10)
+
+# ---------------------------------------------------------------- batch driver
+
+def log_error(path, known, index, fact, error):
+    line = f"[{index}] {fact[:100]}... -> {error}\n"
+    if line not in known:
+        known.add(line)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def run_verification_batch(
+    keys,
+    start_idx=0,
+    end_idx=10,
+    max_workers=4,
+    input_file=DEFAULT_INPUT,
+    output_dir=DEFAULT_OUTPUT_DIR,
+    model=DEFAULT_MODEL,
+    delay=0.5,
+    top_k=6,
+    save_every=5,
+):
+    """Verify claims start_idx..end_idx-1. Safe to re-run: finished claims are skipped.
+
+    Workers only fetch and verify; this thread is the single writer of every output file."""
+    os.makedirs(output_dir, exist_ok=True)
+    paths = {
+        "facts": os.path.join(output_dir, "fact_results.json"),
+        "full": os.path.join(output_dir, "full_output.json"),
+        "parsed": os.path.join(output_dir, "parsed_output.json"),
+        "checkpoint": os.path.join(output_dir, "checkpoint.json"),
+        "errors": os.path.join(output_dir, "error_log.txt"),
+    }
+    done = set(load_json(paths["checkpoint"], []))
+    facts_out = load_json(paths["facts"], [])
+    full_out = load_json(paths["full"], [])
+    parsed_out = load_json(paths["parsed"], [])
+    known_errors = set()
+    if os.path.exists(paths["errors"]):
+        with open(paths["errors"], "r", encoding="utf-8") as f:
+            known_errors = set(f.readlines())
+
+    todo = [(i, fact) for i, fact in load_statements(input_file, start_idx, end_idx) if i not in done]
+    already_done = len(done)
+    failed = 0
+    print(f"{len(todo)} claims to verify with {max_workers} workers ({already_done} already done).")
+
+    def flush():
+        write_json(paths["facts"], merge_unique([], facts_out))
+        write_json(paths["full"], merge_unique([], full_out))
+        write_json(paths["parsed"], merge_unique([], parsed_out))
+        write_json(paths["checkpoint"], sorted(done))
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_fact, fact, keys, model, delay, top_k): (index, fact) for index, fact in todo
+            }
+            for n, future in enumerate(tqdm(as_completed(futures), total=len(futures)), 1):
+                index, fact = futures[future]
+                try:
+                    fact_result, full_output, parsed = future.result()
+                except Exception as e:
+                    failed += 1
+                    log_error(paths["errors"], known_errors, index, fact, e)
+                    continue
+                facts_out.append(fact_result)
+                full_out.append(full_output)
+                parsed_out.append(parsed)
+                done.add(index)
+                if n % save_every == 0:
+                    flush()
+    finally:
+        flush()  # also runs on Ctrl+C, so finished work is never lost
+
+    newly_done = len(done) - already_done
+    print(f"Done: {newly_done} verified, {failed} failed (see {paths['errors']}).")
+    return {"verified": newly_done, "failed": failed}
+
+
+def require_keys():
+    names = {"gemini_api_key": "GEMINI_API_KEY", "google_api_key": "GOOGLE_API_KEY", "cse_id": "GOOGLE_CSE_ID"}
+    keys = {k: os.getenv(env) for k, env in names.items()}
+    missing = [names[k] for k, v in keys.items() if not v]
+    if missing:
+        sys.exit(f"Missing environment variables: {', '.join(missing)}. Copy .env.example to .env and fill it in.")
+    return keys
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify claims with Google Custom Search + Gemini.")
+    parser.add_argument("--start", type=int, default=0, help="first claim index (inclusive)")
+    parser.add_argument("--end", type=int, default=10, help="last claim index (exclusive)")
+    parser.add_argument("--workers", type=int, default=4, help="parallel claims")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model (or set GEMINI_MODEL)")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="JSON-lines file of claims")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--delay", type=float, default=0.5, help="seconds to wait between article downloads")
     args = parser.parse_args()
 
-    run_verification_batch(start_idx=args.start, end_idx=args.end)
+    keys = require_keys()
+    ensure_nltk_data()
+    run_verification_batch(
+        keys,
+        start_idx=args.start,
+        end_idx=args.end,
+        max_workers=args.workers,
+        input_file=args.input,
+        output_dir=args.output_dir,
+        model=args.model,
+        delay=args.delay,
+    )
+
+
+if __name__ == "__main__":
+    main()
