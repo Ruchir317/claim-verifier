@@ -1,14 +1,18 @@
-# Python virtual environments
+# Python
+.venv/
 venv/
 __pycache__/
+.pytest_cache/
+*.tmp
 
 # API keys and secrets
 .env
 
-# VSCode and Jupyter
+# Per-run log of failed claims
+output/error_log.txt
+
+# Editors and OS
 .vscode/
 *.ipynb_checkpoints/
-
-# MacOS / Windows
 .DS_Store
 Thumbs.db

@@ -1,11 +1,11 @@
+python-dotenv
+requests
+tqdm
 google-genai
 google-api-python-client
-google-generativeai
-python-dotenv
 newspaper3k
-tqdm
-nltk
 lxml_html_clean
-scikit-learn 
-matplotlib 
+nltk
+scikit-learn
+matplotlib
 seaborn
