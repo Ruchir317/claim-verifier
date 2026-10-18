@@ -39,10 +39,19 @@ You need three credentials in `.env`:
 
 The free Custom Search quota is small (roughly 100 queries a day at the time of writing; check Google's current limits), so start with a small range.
 
+To check a single claim instead of a batch:
+
+```bash
+python batch_fact_verifier.py --claim "The unemployment rate fell below 4% last year."
+```
+
+It prints the verdict, reasoning and the articles it relied on as JSON. From Python, call `verify_claim(claim, keys)`.
+
 ### Options
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
+| `--claim` | | Verify this one claim, print JSON and exit |
 | `--start`, `--end` | `0`, `10` | Claim index range (end is exclusive) |
 | `--workers` | `4` | Claims verified in parallel |
 | `--model` | `gemini-2.0-flash` | Gemini model; also settable with `GEMINI_MODEL` |

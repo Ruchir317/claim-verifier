@@ -210,6 +210,14 @@ def process_fact(fact, keys, model=DEFAULT_MODEL, delay=0.5, top_k=6):
     )
 
 
+def verify_claim(fact, keys, model=DEFAULT_MODEL, delay=0.5, top_k=6):
+    """Verify a single claim. Returns the parsed verdict plus the articles it was based on.
+
+    Raises ValueError if no usable evidence can be found."""
+    fact_result, _, parsed = process_fact(fact, keys, model, delay, top_k)
+    return {**parsed, "articles": [{"title": a["title"], "url": a["url"]} for a in fact_result["articles"]]}
+
+
 # ---------------------------------------------------------------- batch driver
 
 def log_error(path, known, index, fact, error):
@@ -301,6 +309,7 @@ def require_keys():
 
 def main():
     parser = argparse.ArgumentParser(description="Verify claims with Google Custom Search + Gemini.")
+    parser.add_argument("--claim", help="verify this one claim, print the result as JSON and exit")
     parser.add_argument("--start", type=int, default=0, help="first claim index (inclusive)")
     parser.add_argument("--end", type=int, default=10, help="last claim index (exclusive)")
     parser.add_argument("--workers", type=int, default=4, help="parallel claims")
@@ -312,6 +321,13 @@ def main():
 
     keys = require_keys()
     ensure_nltk_data()
+    if args.claim:
+        try:
+            result = verify_claim(args.claim, keys, model=args.model, delay=args.delay)
+        except ValueError as e:
+            sys.exit(f"Could not verify the claim: {e}")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
     run_verification_batch(
         keys,
         start_idx=args.start,

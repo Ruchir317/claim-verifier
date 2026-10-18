@@ -128,3 +128,34 @@ def test_require_keys_names_what_is_missing(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         bv.require_keys()
     assert "GEMINI_API_KEY" in str(exc.value) and ".env.example" in str(exc.value)
+
+
+def test_verify_claim_returns_the_verdict_and_its_sources(fake_world):
+    result = bv.verify_claim("a good claim", KEYS, delay=0)
+    assert result["verdict"] == "False" and result["fact"] == "a good claim"
+    assert [a["url"] for a in result["articles"]] == ["https://a.example", "https://b.example"]
+
+
+def test_verify_claim_raises_when_there_is_no_evidence(fake_world):
+    with pytest.raises(ValueError, match="No valid articles"):
+        bv.verify_claim("a bad claim", KEYS, delay=0)
+
+
+def test_claim_flag_prints_json_and_skips_the_batch(fake_world, monkeypatch, capsys):
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setattr(bv, "ensure_nltk_data", lambda: None)
+    monkeypatch.setattr("sys.argv", ["batch_fact_verifier.py", "--claim", "a good claim", "--delay", "0"])
+    bv.main()
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["verdict"] == "False" and len(printed["articles"]) == 2
+
+
+def test_claim_flag_reports_a_claim_with_no_evidence(fake_world, monkeypatch):
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setattr(bv, "ensure_nltk_data", lambda: None)
+    monkeypatch.setattr("sys.argv", ["batch_fact_verifier.py", "--claim", "a bad claim", "--delay", "0"])
+    with pytest.raises(SystemExit) as exc:
+        bv.main()
+    assert "Could not verify" in str(exc.value)
