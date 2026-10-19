@@ -23,7 +23,7 @@ claim ─► Google Custom Search ─► download + summarise pages ─► keep 
 
 ## Quick start
 
-Tested on Python 3.14.
+Developed on Python 3.14; the tests also pass on 3.10 and 3.13 in CI.
 
 ```bash
 python -m venv .venv
