@@ -1,5 +1,7 @@
 # Claim Verifier
 
+[![tests](https://github.com/Ruchir317/claim-verifier/actions/workflows/tests.yml/badge.svg)](https://github.com/Ruchir317/claim-verifier/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-MIT-blue)
+
 *Formerly SearchAPI.*
 
 Give it a claim; it searches the web, reads the evidence and returns a **True / False verdict with its reasoning**.
@@ -102,7 +104,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests replace Google, Gemini and the web with fakes, so they run offline and need no API keys. They cover the reply parser, article filtering, the batch run with checkpoint and resume, error logging, and the evaluation maths.
+The tests replace Google, Gemini and the web with fakes, so they run offline and need no API keys. They run in CI on Python 3.10 and 3.13. They cover the reply parser, article filtering, the batch run with checkpoint and resume, error logging, and the evaluation maths.
 
 ## Limitations
 
