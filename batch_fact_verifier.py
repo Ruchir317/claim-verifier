@@ -82,8 +82,9 @@ def merge_unique(existing, new, key="fact"):
 # ---------------------------------------------------------------- retrieval
 
 def ensure_nltk_data():
-    """newspaper3k's summariser loads NLTK's punkt tokenizer, which on some NLTK versions is a separate
-    download. Fetching it up front costs nothing when it is already installed."""
+    """newspaper3k's summariser raises LookupError when NLTK's punkt tokenizer data is missing, which the
+    old code swallowed, so on a fresh machine every page looked unreadable. Fetching it up front costs
+    nothing when it is already installed."""
     import nltk
 
     nltk.download("punkt_tab", quiet=True)
